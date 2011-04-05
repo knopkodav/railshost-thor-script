@@ -1,0 +1,183 @@
+class Config < Thor
+  require 'terminal-color'
+  require 'ghost'
+  
+  desc 'host', "Creates an app's virtual host config for nginx+god+unicorn"
+  method_options :force => :boolean, :hostname => :string, :env => :string, :name => :string
+  
+  def host
+    @dir = Dir.getwd
+    @opts = {'name' => Dir.getwd.sub(/^.*\//, ''), 'env' => 'development'}.merge(options)
+    @opts = @opts.merge({'hostname' => "#{@opts['name']}.local"}).merge(options)
+
+    unicorn_basename = 'unicorn.conf'
+    @unicorn_filename = File.join(@dir, unicorn_basename)
+    @nginx_filename = "/opt/nginx/conf/vhosts/#{@opts['name']}.conf"
+    @god_filename = File.join(File.expand_path("~#{ENV['USER']}"), '.god', 'apps', "#{@opts['name']}.conf")
+    
+    return unless check_file(@unicorn_filename)
+    return unless check_file(@god_filename)
+    return unless check_file(@nginx_filename)
+    
+    puts 'Writing unicorn config'.yellow
+    write_file(@unicorn_filename, :show => true){ unicorn_config }
+    
+    if File.exists?(File.join(@dir, '.git'))
+      puts 'Git repository found, updating .gitignore file'.yellow
+      gitignore_filename = File.join(@dir, '.gitignore')
+      if not File.exists?(gitignore_filename) or File.read(gitignore_filename).split("\n").select{|s| s.strip == unicorn_basename }.empty?
+        File.open(gitignore_filename, 'a') do |f|
+          f.write "\n#{unicorn_basename}\n"
+        end
+      end
+    end
+    
+    puts 'Writing god config'.yellow
+    write_file(@god_filename, :show => true){ god_config }
+    
+    puts 'Writing nginx config'.yellow
+    write_file(@nginx_filename, :use_sudo => true, :show => true){ nginx_config }
+
+    puts 'Adding a hostname to 127.0.0.1'.yellow
+    Host.add(@opts['hostname'], '127.0.0.1', true)
+    
+    puts 'Reloading Nginx'.yellow
+    `sudo /opt/nginx/sbin/nginx -s reload`
+
+    puts 'Starting God'.yellow
+    `god -c #{File.join(File.expand_path("~#{ENV['USER']}"), '.god', 'god.conf')}`
+
+    puts 'Reloading God'.yellow
+    `god load #{File.join(File.expand_path("~#{ENV['USER']}"), '.god', 'god.conf')}`
+    
+    gemfile = File.join(@dir, 'Gemfile')
+    if File.exists?(gemfile)
+      if File.read(gemfile).split("\n").select{|r| r =~ /^ *[^#]*unicorn/ }.empty?
+        puts 'Your Gemfile does not contains unicorn! Please put it available in development environment and run "bundle install"'.red
+        return
+      else
+        gemfile_lock = gemfile + '.lock'
+        if !File.exists?(gemfile_lock) or File.read(gemfile_lock).split("\n").select{|r| r =~ /unicorn/ }.empty?
+          puts 'Your Gemfile contains unicorn, but Gemfile.lock does not contains it. Please run "bundle install" to fix it.'.red
+          return
+        end
+      end
+    else
+      puts 'Gemfile not found. Please ensure you have an unicorn gem and start server manually:'.red; puts
+      puts "$ god start #{@opts['name']}".red
+      return
+    end
+    
+    puts 'Starting application via God'.yellow
+    `god start #{@opts['name']}`
+    
+    puts "Your app should be available now at " + "http://#{@opts['hostname']}".green
+  end
+  
+  
+  private
+  
+  def check_file file
+    if File.exists?(file) && !options[:force]
+      puts "Sorry, but #{file} exists already (use --force to regenerate):".red
+      puts
+      puts `cat #{file}`
+      
+      return false
+    end
+    
+    return true
+  end
+  
+  def write_file file, params = {}
+    raise 'no block given' unless block_given?
+    
+    puts "Writing #{file}".green
+    
+    tmp_file = Tempfile.new("thor-#{@opts['name']}")
+    string = yield
+    tmp_file << string
+    tmp_file.flush
+    `#{params[:use_sudo] ? 'sudo ' : ''}cp #{tmp_file.path} #{file}`
+    tmp_file.close
+    
+    if params[:show]
+      puts
+      puts string
+      puts
+    end
+  end
+  
+  def unicorn_config
+'
+APP_ROOT = "' + @dir + '"
+worker_processes 1
+working_directory APP_ROOT
+listen "#{APP_ROOT}/tmp/unicorn.sock", :backlog => 64
+pid "#{APP_ROOT}/tmp/pids/unicorn-master.pid"
+stderr_path "#{APP_ROOT}/log/unicorn.stderr.log"
+stdout_path "#{APP_ROOT}/log/unicorn.stdout.log"
+'
+  end
+  
+  def nginx_config
+"
+upstream #{@opts['name']}_app {
+  server unix:#{@dir}/tmp/unicorn.sock
+  fail_timeout=0;
+}
+
+server {
+  listen      80;
+  server_name #{@opts['hostname']};
+
+  access_log  #{@dir}/log/nginx-access.log main;
+  error_log   #{@dir}/log/nginx-error.log info;
+
+  root        #{@dir};
+
+  location / {
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header Host $host;
+    proxy_redirect off;
+    proxy_pass http://#{@opts['name']}_app;
+  }
+}
+"
+  end
+
+  def god_config
+'God.watch do |w|
+  rails_root = "' + @dir + '"
+  unicorn_pid = File.join(rails_root, "tmp/pids/unicorn-master.pid")
+
+  w.name = "' + @opts['name'] + '"
+  w.interval = 30.seconds
+
+  w.start = "cd #{rails_root} && bundle exec unicorn_rails -c ' + @unicorn_filename + ' -E development -D" 
+  w.stop = "kill -QUIT `cat #{unicorn_pid}`"
+
+  w.dir = "#{rails_root}"
+
+  w.pid_file = unicorn_pid
+  w.behavior(:clean_pid_file)
+
+  w.start_if do |start|
+    start.condition(:process_running) do |c|
+      c.interval = 5.seconds
+      c.running = false
+    end
+  end
+
+  w.restart_if do |restart|
+    restart.condition(:memory_usage) do |c|
+      c.above = 400.megabytes
+      c.times = [3, 5] # 3 out of 5 intervals
+    end
+  end
+end
+'
+  end
+
+  
+end
