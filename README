@@ -1,0 +1,8 @@
+Installation:
+Checkout files in your ~/.thor/ directory
+
+Usage:
+~/projects/foo-bar $ thor config:host --name foobar --hostname foobar.local --force
+
+All options are optional. Deafult hostname and hame is directory name.
+

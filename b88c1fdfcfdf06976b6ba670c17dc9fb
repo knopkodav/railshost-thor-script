@@ -68,6 +68,9 @@ class Config < Thor
       return
     end
     
+    puts 'Stop application via God'.yellow
+    `god stop #{@opts['name']}`
+    
     puts 'Starting application via God'.yellow
     `god start #{@opts['name']}`
     
@@ -109,8 +112,7 @@ class Config < Thor
   end
   
   def unicorn_config
-'
-APP_ROOT = "' + @dir + '"
+'APP_ROOT = "' + @dir + '"
 worker_processes 1
 working_directory APP_ROOT
 listen "#{APP_ROOT}/tmp/unicorn.sock", :backlog => 64
@@ -121,8 +123,7 @@ stdout_path "#{APP_ROOT}/log/unicorn.stdout.log"
   end
   
   def nginx_config
-"
-upstream #{@opts['name']}_app {
+"upstream #{@opts['name']}_app {
   server unix:#{@dir}/tmp/unicorn.sock
   fail_timeout=0;
 }
